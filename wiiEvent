@@ -1,0 +1,300 @@
+/*
+WiiRvent.c
+機能:wiiリモコン操作によるプレイヤーの移動イベント関数(ただし仮にSDLによる描写とメイン関数を含めて動作確認を行なっている)
+*/
+
+#include "gamesystem.h"
+#include "client_func.h"
+
+void PlayerMoveEvent(wiimote_t wiimote);//Wiiリモコン操作による移動等のイベント処理
+
+
+int UpFlag;//ジャンプ用のフラグ
+int JumpFlag;//ジャンプを1回のみ適応するためのフラグ
+int FloorFlag;//床の上にいるかどうか
+
+
+int botm_y = GameFloor;//地面の座標
+
+static int PL_y;//プレイヤーがジャンプ始めた位置
+static int cID;
+
+
+SDL_Surface *MainWindow;
+
+//ネットワーク用
+static int NetworkEvent(void *data);
+
+/**/
+
+// メイン関数
+int main(int argc, char* argv[]) {
+
+    	int showvalues = 0; // 1:センサ値表示, それ以外:非表示
+/*
+//CharaInfo構造体の中へ移動し,InitSttsで初期化
+        UpFlag = 0;
+        JumpFlag = 0;
+        FloorFlag = CT_NUM;
+*/
+        PL_y = GameFloor;
+
+	/*ネットワーク用変数/関数*/
+	int	num;
+    	char	name[MAX_CLIENTS][MAX_NAME_SIZE];
+    	int	endFlag=1;
+    	char	localHostName[]="localhost";
+    	char	*serverName;
+    	int	clientID;
+    	SDL_Thread	*thr;
+
+	XInitThreads();
+	/**/
+
+	// Wiiリモコンを用いるための構造体を宣言（初期化）
+	wiimote_t wiimote = WIIMOTE_INIT;	// Wiiリモコンの状態格納用
+	wiimote_report_t report = WIIMOTE_REPORT_INIT;	// レポートタイプ用
+
+	// Wiiリモコンのスピーカで鳴らす音のデータ
+	uint8_t sample[20] = {
+		0x3c,0x3c,0x3c,0x3c,0x3c,0x3c,0x3c,0x3c,0x3c,0x3c,
+		0x3c,0x3c,0x3c,0x3c,0x3c,0x3c,0x3c,0x3c,0x3c,0x3c
+	};
+
+	// SDL初期化
+	if(SDL_Init(SDL_INIT_VIDEO) < 0) {
+		printf("failed to initialize SDL.\n");
+		exit(-1);
+	}
+
+	
+	//ゲームシステムの初期化
+        if(InitStts() < 0)
+        {
+            printf("InitStts miss\n");
+            exit(-1);
+        }
+
+
+	//引数チェック
+	if(argc == 2){
+    	   serverName = localHostName;
+	   // Wiiリモコンの接続（１つのみ）
+	   if (wiimote_connect(&wiimote, argv[1]) < 0) {	// コマンド引数に指定したWiiリモコン識別情報を渡して接続
+		printf("unable to open wiimote: %s\n", wiimote_get_error());
+	        exit(1);
+	   }	
+    	}
+    	else if(argc == 3){ /**/
+    	   serverName = argv[1];
+	   // Wiiリモコンの接続（１つのみ）
+	   if (wiimote_connect(&wiimote, argv[2]) < 0) {	// コマンド引数に指定したWiiリモコン識別情報を渡して接続
+		printf("unable to open wiimote: %s\n", wiimote_get_error());
+		exit(1);
+	   }
+        }
+        else{
+	   fprintf(stderr, "Usage: %s, Cannot find a Server Name.\n", argv[0]);
+	   return -1;
+        }
+
+	/* サーバーとの接続 */
+    	if(SetUpClient(serverName,&clientID,&num,name)==-1){
+		fprintf(stderr,"setup failed : SetUpClient\n");
+		return -1;
+	}
+
+       
+        if(clientID == CT_Player)
+            gID = CT_Player;
+        else if(clientID == CT_Player2)
+            gID = CT_Player2;
+
+
+    	/* ネットワークイベント処理スレッドの作成 */
+	thr = SDL_CreateThread(NetworkEvent, &endFlag);
+
+	// ウィンドウ生成
+	if((MainWindow = SDL_SetVideoMode(WindowSize_w, WindowSize_h, 32, SDL_SWSURFACE)) == NULL) {
+		printf("failed to initialize videomode.\n");
+		exit(-1);
+	}
+	
+	/**カメラ処理**/
+	//take_picture(MainWindow);
+	init_window(MainWindow);	
+		
+
+  	//背景,キャラの描写
+        if(InitImage() < 0)
+        {
+            exit(-1);
+        }
+
+	wiimote.led.one  = 1;	// WiiリモコンのLEDの一番左を点灯させる（接続を知らせるために）
+
+	// Wiiリモコンスピーカの初期化
+	wiimote_speaker_init(&wiimote, WIIMOTE_FMT_S4, WIIMOTE_FREQ_44800HZ);
+
+        // センサからのデータを受け付けるモードに変更
+        wiimote.mode.acc = 1;
+
+
+	/*乱数の初期化*/
+        // srand((unsigned) time(NULL));
+
+         InitPlaceChara();
+        InitBlitWindow();
+
+	// Wiiリモコンがオープン（接続状態）であればループ
+	while(endFlag){
+
+		if(wiimote_is_open(&wiimote)) {
+		   // Wiiリモコンの状態を取得・更新する
+		   if (wiimote_update(&wiimote) < 0) {
+			wiimote_disconnect(&wiimote);
+			break;
+		   }
+	   	}
+
+           	PlayerMoveEvent(wiimote);
+           	MoveChara();
+
+           	int i,j,w;
+              	for(i = 0; i<gCharaNum; i++)
+                    for(j = i+1; j<gCharaNum; j++)
+                        Collision(&gChara[i], &gChara[j]);
+
+              	PlaceChara();
+                BlitWindow();
+              	ClearChara();
+
+		/*少し待つ*/
+                //  SDL_Delay(2);
+        };
+
+	SDL_WaitThread(thr,NULL);
+        DestroyWindow();
+        DestroySystem();
+	SDL_Quit();
+	CloseSoc();
+	return 0;
+}
+
+
+
+
+void PlayerMoveEvent(wiimote_t wiimote)
+{
+  
+    int Jump_Lim = 300;//プレイヤーのジャンプできる高さの制限
+
+    
+
+	// ***** Wiiのキー（ボタン）ごとに処理 *****
+		// HOMEボタンが押された時
+		if (wiimote.keys.home) {
+			wiimote_speaker_free(&wiimote);	// Wiiリモコンのスピーカを解放
+			wiimote_disconnect(&wiimote);	// Wiiリモコンとの接続を解除
+			exit(-1);
+		}
+
+                if(wiimote.keys.down)//縦に持った時に下(横方向だと右)を押す(wiimote.key.down != 0の略)
+                {
+                     gChara[gID].point.x = gChara[gID].pos.x + 2;//x座標に＋２
+                     //    printf("gID:%d \n",gID);
+		     //gChara[CT_Player2].point.x = gChara[CT_Player2].pos.x - 2;//x座標に＋２
+                }
+
+                if(wiimote.keys.up)//縦に持った時に上(横方向だと左)を押す
+                {
+                    gChara[gID].point.x = gChara[gID].pos.x - 2;//x座標にー２
+		    //gChara[CT_Player2].point.x = gChara[CT_Player].pos.x + 2;//x座標にー２
+                }
+
+
+                if(gChara[gID].UpFlag == 1)//床にいるときにwiiリモコンを振って空中の時
+                {
+                    gChara[gID].base.y = -1;//飛び上がる
+                }
+                if(gChara[gID].pos.y <= PL_y - Jump_Lim || gChara[gID].pos .y <= 5)//一定距離上がったならば
+                        gChara[gID].UpFlag = 0;//元に戻るようにする
+
+                if(gChara[gID].UpFlag == 0)//空中にいる(下に戻るとき)(自然落下あり)
+                {
+                    gChara[gID].base.y = 1;
+                } 
+
+                if(gChara[gID].UpFlag == 2)//床の上にいるなら
+                {
+                    gChara[gID].base.y = 0;
+                }
+
+                if(gChara[gID].pos.y >= GameFloor && gChara[gID].UpFlag == 0)//地面に戻ったなら(または足元に当たり判定が起きたら)
+                {
+                        gChara[gID].JumpFlag = 0;//空中にいるフラグとジャンプ入力取得を0に戻す(ジャンプが終わった)
+                        gChara[gID].point.y = GameFloor;
+                }
+
+                if((gChara[gID].UpFlag == 0 || gChara[gID].UpFlag == 2) && gChara[gID].JumpFlag == 0){//ジャンプしていないとき
+                    if((wiimote.axis.x >= 110 && wiimote.axis.x <= 125 )&&(wiimote.axis.y >= 125 && wiimote.axis.y <= 130)&&(wiimote.axis.z >= 115 && wiimote.axis.z <= 130))
+                    {
+                        PL_y = gChara[gID].pos.y;//ジャンプはじめたPLの位置(y)
+                        gChara[gID].UpFlag = 1;//空中にいるフラグ
+                        gChara[gID].JumpFlag = 1;//一度だけ獲得する(もう一度ジャンプしないように)
+                    }
+                }
+
+		SendPlayCommand(gChara[gID].point.x, gChara[gID].point.y, gChara[gID].base.y);
+
+                return;
+}
+
+/*****************************************************************
+関数名  : NetworkEvent
+機能    : ネットワークのイベントループ
+引数    : void		*data		: 終了判定フラグ
+出力    : スレッド終了時に０を返す
+*****************************************************************/
+static int NetworkEvent(void *data)
+{
+	int *endFlag;
+	
+	endFlag = (int*)data;
+    while(*endFlag){
+        *endFlag = SendRecvManager();
+    }
+	return 0;
+}
+
+/*****************************************************************
+関数名  : UpdateCharacter
+機能    : サーバーから届いた他プレイヤの座標を更新
+引数    : void		*data		: 終了判定フラグ
+出力    : スレッド終了時に０を返す
+*****************************************************************/
+void UpdateChara(int pointx, int pointy, int basey){
+
+    if(gID == 0)
+    {
+
+        gChara[CT_Player2].point.x = pointx;
+        gChara[CT_Player2].point.y = pointy;
+/*
+	gChara[CT_Player2].point.x = pointx + 200;
+	gChara[CT_Player2].point.y = pointy - 200;
+	gChara[CT_Player2].base.y = basey;
+*/
+    }
+
+    if(gID == 1)
+    {
+        gChara[CT_Player].point.x = pointx;
+        gChara[CT_Player].point.y = pointy;
+/*
+        gChara[CT_Player].base.y = basey;
+*/
+    }
+
+}
+
